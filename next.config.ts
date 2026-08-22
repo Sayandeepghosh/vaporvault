@@ -46,8 +46,12 @@ const productionOnlyHeaders = [
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  // Required for the slim runtime image in the Dockerfile.
-  output: "standalone",
+  /**
+   * `standalone` is what the Dockerfile copies out of the build. On Vercel it is
+   * unnecessary — the platform produces its own function bundles — so it is skipped there
+   * rather than building an artefact nobody consumes.
+   */
+  output: process.env.VERCEL ? undefined : "standalone",
   // Do not advertise the framework version.
   poweredByHeader: false,
   async headers() {
