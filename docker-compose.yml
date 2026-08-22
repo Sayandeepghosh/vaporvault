@@ -1,0 +1,84 @@
+name: vaporvault
+
+services:
+  # ---------------------------------------------------------------------------
+  # Ephemeral store.
+  #
+  # Persistence is switched off on purpose. Ciphertext is worthless without the
+  # key in the URL fragment, but writing it to disk creates a durable artefact
+  # that outlives the secret's lifetime and ends up in backups and snapshots.
+  # RDB and AOF are both disabled and /data is a tmpfs, so nothing survives a
+  # restart -- which is exactly the guarantee the product makes.
+  #
+  # `noeviction` matters just as much: under an eviction policy Redis would
+  # silently drop live secrets when memory filled up, and senders would hand out
+  # links that had already stopped working. Failing writes loudly is better.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:8.10.1-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+      - --loglevel
+      - notice
+    # Not published to the host: reachable only from the app on the internal network.
+    expose:
+      - "6379"
+    networks:
+      - internal
+    tmpfs:
+      - /data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env (32+ chars)}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      # 0 = ignore X-Forwarded-For, because with no reverse proxy in front of the
+      # app that header is entirely client-controlled. Raise this to the number of
+      # proxies you actually operate to get per-client rate limiting. See README.
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
+      CLIENT_IP_HEADER: ${CLIENT_IP_HEADER:-x-forwarded-for}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  internal:
+    driver: bridge
