@@ -26,8 +26,22 @@ const envSchema = z.object({
    */
   APP_SECRET: z.string().min(32, "APP_SECRET must be at least 32 characters").optional(),
 
-  /** Comma-separated list of origins allowed to call the API. Required in production. */
+  /**
+   * Comma-separated list of origins allowed to call the API.
+   * Required in production unless the platform supplies one (see `platformOrigins`).
+   */
   ALLOWED_ORIGINS: z.string().optional(),
+
+  /*
+   * Vercel system variables. Set by the platform at build and run time, never by the
+   * client, so they are safe to fold into the origin allow-list. Without them every
+   * preview deployment would reject its own API calls, because its `*.vercel.app`
+   * hostname is not something you can know in advance.
+   */
+  VERCEL: z.string().optional(),
+  VERCEL_URL: z.string().optional(),
+  VERCEL_BRANCH_URL: z.string().optional(),
+  VERCEL_PROJECT_PRODUCTION_URL: z.string().optional(),
 
   /**
    * Number of reverse proxies you actually operate between the internet and this app.
@@ -106,6 +120,38 @@ function parseOrigins(raw: string | undefined): Set<string> {
   return origins;
 }
 
+type PlatformEnv = Pick<
+  z.infer<typeof envSchema>,
+  "VERCEL" | "VERCEL_URL" | "VERCEL_BRANCH_URL" | "VERCEL_PROJECT_PRODUCTION_URL"
+>;
+
+/**
+ * Origins the hosting platform guarantees belong to this deployment.
+ *
+ * Vercel exposes these as bare hostnames with no scheme, and always over HTTPS. They are
+ * injected into the function environment by the platform, so unlike a request header they
+ * cannot be influenced by a caller — which is what makes it safe to trust them for CSRF
+ * decisions. Anything not on this list still has to be declared in `ALLOWED_ORIGINS`.
+ */
+function platformOrigins(env: PlatformEnv): string[] {
+  if (!env.VERCEL) return [];
+
+  const hosts = [env.VERCEL_PROJECT_PRODUCTION_URL, env.VERCEL_URL, env.VERCEL_BRANCH_URL];
+  const origins: string[] = [];
+
+  for (const host of hosts) {
+    if (!host) continue;
+    const candidate = host.includes("://") ? host : `https://${host}`;
+    try {
+      origins.push(new URL(candidate).origin);
+    } catch {
+      // A malformed platform variable is not worth failing a boot over; skip it.
+    }
+  }
+
+  return origins;
+}
+
 /** Domain-separated sub-key derivation, so one leaked purpose does not leak the others. */
 function deriveSubKey(appSecret: string, label: string): Buffer {
   return createHmac("sha256", appSecret).update(`vaporvault/v1/${label}`).digest();
@@ -126,9 +172,12 @@ export function getServerConfig(): ServerConfig {
   const env = parsed.data;
   const isProduction = env.NODE_ENV === "production";
   const allowedOrigins = parseOrigins(env.ALLOWED_ORIGINS);
+  for (const origin of platformOrigins(env)) allowedOrigins.add(origin);
 
   if (isProduction && allowedOrigins.size === 0) {
-    throw new ConfigurationError("ALLOWED_ORIGINS must be set in production");
+    throw new ConfigurationError(
+      "No allowed origin is configured. Set ALLOWED_ORIGINS (a custom domain always needs it).",
+    );
   }
 
   let appSecret = env.APP_SECRET;
