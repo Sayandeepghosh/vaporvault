@@ -54,12 +54,21 @@ fi
 # --- create the remote repository, if we can --------------------------------
 
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  GH_USER="$(gh api user --jq .login 2>/dev/null || true)"
+
   if gh repo view "${GITHUB_USERNAME}/${REPO_NAME}" >/dev/null 2>&1; then
     echo "Remote repository already exists; reusing it."
+  elif [[ -n "$GH_USER" && "$GH_USER" != "$GITHUB_USERNAME" ]]; then
+    # Creating under an account you are not logged in as fails with an opaque API error,
+    # so say so plainly instead and let the push report the outcome.
+    echo "Note: gh is authenticated as '${GH_USER}', not '${GITHUB_USERNAME}'."
+    echo "      Skipping automatic creation. Create ${GITHUB_USERNAME}/${REPO_NAME} on GitHub if it does not exist."
   else
     echo "Creating ${GITHUB_USERNAME}/${REPO_NAME} (${VISIBILITY})..."
+    # Non-fatal: you may have already created it in the browser.
     gh repo create "${GITHUB_USERNAME}/${REPO_NAME}" \
-      "--${VISIBILITY}" --description "$DESCRIPTION"
+      "--${VISIBILITY}" --description "$DESCRIPTION" ||
+      echo "Could not create it automatically; continuing to the push."
   fi
 else
   echo "gh CLI not available; assuming ${GITHUB_USERNAME}/${REPO_NAME} already exists."
