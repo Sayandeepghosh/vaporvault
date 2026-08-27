@@ -75,6 +75,24 @@ export function proxy(request: NextRequest): NextResponse {
 }
 
 export const config = {
-  // Skip build assets: they need long-lived caching and carry no user data.
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|robots.txt).*)"],
+  /**
+   * Skip build assets: they need long-lived caching, carry no user data, and must not
+   * receive a per-request nonce that would then sit in shared caches.
+   *
+   * Every exclusion is anchored and has its dots escaped. An unanchored pattern with a
+   * bare `.` is a real hole rather than a cosmetic one: `favicon.ico` would also match
+   * `/faviconXico`, and a prefix-only `_next/static` would also match `/_next/staticx`.
+   * Those paths render the full HTML app shell, so they would have been served with no
+   * Content-Security-Policy at all.
+   */
+  /*
+   * Only genuinely static, non-HTML responses are excluded, and each has been verified to
+   * be so: `_next/static/` serves JS and CSS, `icon.svg` an image, `robots.txt` plain text.
+   *
+   * `favicon.ico` is deliberately NOT excluded. There is no `public/favicon.ico`, so Next
+   * falls through and serves the HTML 404 page for it — and browsers request that path on
+   * every page load, which made it the single most-fetched un-CSP'd HTML response in the
+   * app. Anything that can return HTML must go through the proxy.
+   */
+  matcher: ["/((?!_next/static/|icon\\.svg$|robots\\.txt$).*)"],
 };
