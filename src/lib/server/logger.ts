@@ -13,8 +13,39 @@ export type LogFields = Record<string, LogValue>;
 
 const REDACTED = "[redacted]";
 
+/**
+ * Deny-list of field names whose values must never be serialised.
+ *
+ * A deny-list is the wrong shape for this job — it fails silently the moment someone
+ * invents a new field name — so `emit` additionally drops any key that is not on the
+ * explicit allow-list below. This pattern is kept as a second layer.
+ */
 const SENSITIVE_KEY_PATTERN =
-  /(secret|passphrase|password|token|cipher|ciphertext|envelope|plaintext|\bct\b|\bkey\b|\biv\b|salt|authorization|cookie|fragment|\bid\b)/i;
+  /(secret|passphrase|password|token|cipher|ciphertext|envelope|plaintext|\bct\b|key|\biv\b|salt|authorization|cookie|fragment|\bid\b|ident|\bip\b|addr|host|url|payload|body|data|value|content|hash|digest|referer|agent)/i;
+
+/**
+ * Field names this logger is permitted to emit verbatim.
+ *
+ * Anything else is redacted even if the deny-list above misses it, so adding a new log
+ * field is a deliberate act rather than an accidental disclosure. Nothing here can carry
+ * a secret id, ciphertext, key material or a client address.
+ */
+const ALLOWED_KEYS = new Set([
+  "code",
+  "detail",
+  "durationMs",
+  "errorMessage",
+  "errorName",
+  "event",
+  "hits",
+  "limit",
+  "reason",
+  "rule",
+  "scope",
+  "status",
+  "trusted",
+  "ttlSeconds",
+]);
 
 const MAX_VALUE_LENGTH = 256;
 
@@ -22,7 +53,7 @@ function sanitise(fields: LogFields): Record<string, LogValue> {
   const out: Record<string, LogValue> = {};
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined) continue;
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
+    if (!ALLOWED_KEYS.has(key) || SENSITIVE_KEY_PATTERN.test(key)) {
       out[key] = REDACTED;
       continue;
     }
