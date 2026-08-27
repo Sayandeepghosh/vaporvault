@@ -17,12 +17,25 @@ const subscribeNever = () => () => {};
 const snapshotClient = () => true;
 const snapshotServer = () => false;
 
-type Stage = "idle" | "revealing" | "revealed" | "gone";
+type Stage = "idle" | "revealing" | "revealed" | "gone" | "lost";
 
 type Link =
   | { status: "pending" }
   | { status: "invalid" }
+  /** The fragment was already used and stripped in this tab. */
+  | { status: "consumed" }
   | { status: "ok"; fragment: LinkFragment };
+
+/** Marker written into the history entry once a secret has been read in this tab. */
+const READ_MARKER = "vaporvaultRead";
+
+/** Statuses the guard pipeline returns before the store is ever consulted. */
+const RETRY_IS_SAFE = new Set([403, 413, 415, 429]);
+
+function historyMarksRead(): boolean {
+  const state: unknown = window.history.state;
+  return typeof state === "object" && state !== null && READ_MARKER in state;
+}
 
 export interface RevealSecretPanelProps {
   secretId: string;
@@ -51,7 +64,14 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
     try {
       return { status: "ok", fragment: parseFragment(window.location.hash) };
     } catch {
-      return { status: "invalid" };
+      /**
+       * No usable fragment. Distinguish "you already read this here" from "the key never
+       * arrived": after a successful reveal we strip the fragment ourselves, so on reload
+       * this branch is reached for a secret the user consumed. Telling them the key was
+       * stripped in transit would be actively misleading — it blames the transport and
+       * invites them to ask for a re-share, which puts the same plaintext on the wire twice.
+       */
+      return historyMarksRead() ? { status: "consumed" } : { status: "invalid" };
     }
   }, [mounted]);
 
@@ -72,6 +92,17 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
    */
   const envelopeRef = useRef<SecretEnvelope | null>(null);
   const outputRef = useRef<HTMLPreElement>(null);
+  /**
+   * Latched immediately before the destructive POST is dispatched.
+   *
+   * The server deletes atomically, so once the request is on the wire the secret is gone
+   * whether or not we ever see the response. If the response is lost we must NOT re-enable
+   * a "try again" button: the retry cannot succeed, and offering it makes the user believe
+   * a network blip is at fault and ask the sender to share the secret a second time.
+   */
+  const postIssuedRef = useRef(false);
+  /** Mutual exclusion that does not depend on React's commit timing or the DOM. */
+  const inFlightRef = useRef(false);
 
   useEffect(() => {
     if (stage === "revealed") outputRef.current?.focus();
@@ -79,6 +110,10 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
 
   const reveal = useCallback(async () => {
     if (link.status !== "ok") return;
+    // A ref, not the disabled attribute: three programmatic clicks in one task would
+    // otherwise fire three destructive POSTs before React committed the disabled state.
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
 
     setError(null);
     setStage("revealing");
@@ -87,6 +122,7 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
       let envelope = envelopeRef.current;
 
       if (!envelope) {
+        postIssuedRef.current = true;
         // The destructive step. Only ever issued from here, after an explicit click, which
         // is why unfurlers and prefetchers cannot consume a secret.
         const response = await fetch(`/api/secrets/${encodeURIComponent(secretId)}/reveal`, {
@@ -100,6 +136,12 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
 
         if (!response.ok) {
           setError(await describeApiFailure(response));
+          // These statuses are produced by the guard pipeline before the store is touched,
+          // so the secret provably survives and a retry is legitimate. A 503 is genuinely
+          // ambiguous — it can be a fail-closed limiter, or a store command that timed out
+          // after it had already deleted — so the latch stays set and a later failure is
+          // reported as unrecoverable rather than as a network blip.
+          if (RETRY_IS_SAFE.has(response.status)) postIssuedRef.current = false;
           setStage(response.status === 404 ? "gone" : "idle");
           return;
         }
@@ -128,11 +170,22 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
       setEnvelopeHeld(false);
       setPassphrase("");
       // Take the key out of the address bar and session history now that it has been used.
-      // Only on success: a reload before this point must still work.
-      window.history.replaceState(null, "", window.location.pathname);
+      // Only on success: a reload before this point must still work. The marker lets a
+      // later reload explain what happened instead of claiming the link was incomplete.
+      window.history.replaceState({ [READ_MARKER]: true }, "", window.location.pathname);
     } catch (caught) {
+      /**
+       * If the POST went out but we never got a usable envelope, the secret is already
+       * destroyed and no retry can recover it. Say so, terminally.
+       */
+      if (postIssuedRef.current && envelopeRef.current === null) {
+        setStage("lost");
+        return;
+      }
       setError(isCryptoError(caught) ? caught.message : NETWORK_FAILURE_MESSAGE);
       setStage("idle");
+    } finally {
+      inFlightRef.current = false;
     }
   }, [link, passphrase, secretId]);
 
@@ -172,12 +225,32 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
     );
   }
 
+  if (link.status === "consumed") {
+    return (
+      <Callout tone="warning" role="alert" title="You already read this secret">
+        It was decrypted in this tab and destroyed on the server at that moment. Reloading
+        cannot bring it back, and neither can we. If you still need the value, ask the sender
+        to share a new one.
+      </Callout>
+    );
+  }
+
   if (link.status === "invalid") {
     return (
       <Callout tone="danger" role="alert" title="This link is incomplete">
         The decryption key is missing from the URL. It sits after the{" "}
         <code className="font-mono">#</code>, and some chat clients and email scanners strip
         it. Ask the sender for the full link, or for a new one.
+      </Callout>
+    );
+  }
+
+  if (stage === "lost") {
+    return (
+      <Callout tone="danger" role="alert" title="This secret could not be recovered">
+        The request to read it reached the server, which destroys a secret the moment it is
+        read — but the reply never made it back here, so it could not be decrypted. Retrying
+        will not help: the ciphertext no longer exists. Ask the sender for a new link.
       </Callout>
     );
   }
@@ -193,7 +266,8 @@ export function RevealSecretPanel({ secretId }: RevealSecretPanelProps) {
 
   return (
     <div className="space-y-5">
-      <Callout tone="warning" title="You can only do this once">
+      {/* role="alert" so the destructive consequence is announced, not just displayed. */}
+      <Callout tone="warning" role="alert" title="You can only do this once">
         Revealing destroys the secret immediately. Make sure you can store it somewhere safe
         before you continue.
       </Callout>
