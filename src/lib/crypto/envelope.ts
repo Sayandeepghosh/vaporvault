@@ -20,6 +20,7 @@ import {
   type Bytes,
 } from "@/lib/crypto/encoding";
 import { CryptoError } from "@/lib/crypto/errors";
+import { parseJsonSafely } from "@/lib/safe-json";
 
 /**
  * The only thing the server ever stores.
@@ -83,7 +84,7 @@ export function serialiseEnvelope(envelope: SecretEnvelope): string {
 export function deserialiseEnvelope(raw: string): SecretEnvelope | null {
   let candidate: unknown;
   try {
-    candidate = JSON.parse(raw);
+    candidate = parseJsonSafely(raw);
   } catch {
     return null;
   }
@@ -122,6 +123,10 @@ export function serialiseFragment(linkKey: Uint8Array, requiresPassphrase: boole
  * @throws CryptoError `INVALID_LINK`
  */
 export function parseFragment(raw: string): LinkFragment {
+  // Total over any input: callers pass `window.location.hash`, and this must raise the
+  // documented CryptoError rather than leaking a raw TypeError from `startsWith`.
+  if (typeof raw !== "string") throw new CryptoError("INVALID_LINK");
+
   const attempt = (value: string): LinkFragment | null => {
     if (value.length === 0 || value.length > MAX_FRAGMENT_LENGTH) return null;
 

@@ -23,6 +23,7 @@ import {
   AES_KEY_BITS,
   AES_KEY_BYTES,
   AES_TAG_BITS,
+  CIPHERTEXT_B64_MAX_LENGTH,
   HKDF_INFO,
   KDF_SALT_BYTES,
   MAX_PASSPHRASE_LENGTH,
@@ -35,7 +36,6 @@ import {
   concatBytes,
   fromBase64Url,
   toBase64Url,
-  utf8ByteLength,
   utf8Decode,
   utf8Encode,
   zeroize,
@@ -63,13 +63,32 @@ function randomBytes(length: number): Bytes {
   return requireWebCrypto().getRandomValues(new Uint8Array(length));
 }
 
-function assertPassphraseLength(passphrase: string, enforceMinimum: boolean): void {
-  if (passphrase.length > MAX_PASSPHRASE_LENGTH) {
-    throw new CryptoError("PASSPHRASE_TOO_LONG");
-  }
-  if (enforceMinimum && passphrase.length < MIN_PASSPHRASE_LENGTH) {
+/**
+ * Normalise a passphrase, then bound it.
+ *
+ * Order matters. NFKC both contracts and expands — three Hangul jamo (9 UTF-16 units)
+ * collapse to one syllable each, and U+FDFA expands to 18 characters — so bounds measured
+ * on the raw input do not constrain what actually reaches PBKDF2. Measuring the normalised
+ * form in code points means the limits apply to the value being hashed, and that the same
+ * effective passphrase is accepted or rejected consistently however it was typed.
+ *
+ * Returns `undefined` when no passphrase was supplied.
+ */
+function normalisePassphrase(
+  passphrase: string | undefined,
+  enforceMinimum: boolean,
+): string | undefined {
+  if (passphrase === undefined || passphrase.length === 0) return undefined;
+
+  const normalised = passphrase.normalize("NFKC");
+  const codePoints = [...normalised].length;
+
+  if (codePoints > MAX_PASSPHRASE_LENGTH) throw new CryptoError("PASSPHRASE_TOO_LONG");
+  if (enforceMinimum && codePoints < MIN_PASSPHRASE_LENGTH) {
     throw new CryptoError("PASSPHRASE_TOO_SHORT");
   }
+
+  return normalised;
 }
 
 /**
@@ -81,22 +100,22 @@ function assertPassphraseLength(passphrase: string, enforceMinimum: boolean): vo
 async function deriveContentKey(
   linkKey: Bytes,
   salt: Bytes,
+  /** Already NFKC-normalised and length-checked by `normalisePassphrase`. */
   passphrase: string | undefined,
 ): Promise<CryptoKey> {
   const { subtle } = requireWebCrypto();
 
+  let passBytes: Bytes | undefined;
   let passMaterial: Bytes | undefined;
   let ikm: Bytes | undefined;
 
   try {
     if (passphrase !== undefined) {
-      const passphraseKey = await subtle.importKey(
-        "raw",
-        utf8Encode(passphrase.normalize("NFKC")),
-        "PBKDF2",
-        false,
-        ["deriveBits"],
-      );
+      // Held in a tracked local so the UTF-8 copy of the passphrase is scrubbed too.
+      passBytes = utf8Encode(passphrase);
+      const passphraseKey = await subtle.importKey("raw", passBytes, "PBKDF2", false, [
+        "deriveBits",
+      ]);
       const derived = await subtle.deriveBits(
         { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
         passphraseKey,
@@ -119,7 +138,7 @@ async function deriveContentKey(
       ["encrypt", "decrypt"],
     );
   } finally {
-    zeroize(passMaterial, ikm);
+    zeroize(passBytes, passMaterial, ikm);
   }
 }
 
@@ -140,23 +159,33 @@ export async function encryptSecret({
   plaintext,
   passphrase,
 }: EncryptSecretInput): Promise<EncryptSecretResult> {
-  const plaintextBytes = utf8ByteLength(plaintext);
-  if (plaintextBytes === 0) throw new CryptoError("EMPTY_SECRET");
-  if (plaintextBytes > MAX_PLAINTEXT_BYTES) throw new CryptoError("SECRET_TOO_LARGE");
+  // Guard the type explicitly: `TextEncoder.encode` coerces anything, so without this a
+  // non-string would be silently encrypted as `"null"` or `"[object Object]"`.
+  if (typeof plaintext !== "string") throw new CryptoError("EMPTY_SECRET");
 
-  const usePassphrase = passphrase !== undefined && passphrase.length > 0;
-  if (usePassphrase) assertPassphraseLength(passphrase, true);
+  const normalisedPassphrase = normalisePassphrase(passphrase, true);
+  const usePassphrase = normalisedPassphrase !== undefined;
 
   const { subtle } = requireWebCrypto();
 
   const linkKey = randomBytes(AES_KEY_BYTES);
   const salt = randomBytes(KDF_SALT_BYTES);
   const iv = randomBytes(AES_IV_BYTES);
+  /**
+   * Encoded exactly once, then measured.
+   *
+   * Reading `plaintext` twice — once to measure, once to encrypt — left a second copy of
+   * the secret in memory that nothing scrubbed, and made the size cap a check-then-use
+   * race against any value whose string conversion changes between the two reads.
+   */
   let payload: Bytes | undefined;
 
   try {
-    const contentKey = await deriveContentKey(linkKey, salt, usePassphrase ? passphrase : undefined);
     payload = utf8Encode(plaintext);
+    if (payload.byteLength === 0) throw new CryptoError("EMPTY_SECRET");
+    if (payload.byteLength > MAX_PLAINTEXT_BYTES) throw new CryptoError("SECRET_TOO_LARGE");
+
+    const contentKey = await deriveContentKey(linkKey, salt, normalisedPassphrase);
 
     const ciphertext = await subtle.encrypt(
       {
@@ -196,15 +225,20 @@ export async function decryptSecret({
   passphrase,
 }: DecryptSecretInput): Promise<string> {
   const parsed = typeof fragment === "string" ? parseFragment(fragment) : fragment;
+  // We own the buffer only when we parsed it ourselves; a caller-supplied fragment stays
+  // the caller's to manage.
+  const ownsLinkKey = typeof fragment === "string";
 
   if (parsed.requiresPassphrase && (passphrase === undefined || passphrase.length === 0)) {
     throw new CryptoError("PASSPHRASE_REQUIRED");
   }
-  if (passphrase !== undefined && passphrase.length > 0) {
-    assertPassphraseLength(passphrase, false);
-  }
+  const normalisedPassphrase = normalisePassphrase(passphrase, false);
 
   if (envelope.v !== PROTOCOL_VERSION) throw new CryptoError("DECRYPT_FAILED");
+  if (parsed.linkKey.byteLength !== AES_KEY_BYTES) throw new CryptoError("DECRYPT_FAILED");
+  // Bound the ciphertext before decoding it, so this module is safe even when it is not
+  // sitting behind the response schema that normally enforces the same limit.
+  if (envelope.ct.length > CIPHERTEXT_B64_MAX_LENGTH) throw new CryptoError("DECRYPT_FAILED");
 
   const { subtle } = requireWebCrypto();
 
@@ -227,7 +261,7 @@ export async function decryptSecret({
     const contentKey = await deriveContentKey(
       parsed.linkKey,
       salt,
-      parsed.requiresPassphrase ? passphrase : undefined,
+      parsed.requiresPassphrase ? normalisedPassphrase : undefined,
     );
 
     const decrypted = await subtle.decrypt(
@@ -249,6 +283,6 @@ export async function decryptSecret({
     // Never surface the underlying WebCrypto/OperationError detail.
     throw new CryptoError("DECRYPT_FAILED");
   } finally {
-    zeroize(plaintextBytes);
+    zeroize(plaintextBytes, ownsLinkKey ? parsed.linkKey : undefined);
   }
 }
