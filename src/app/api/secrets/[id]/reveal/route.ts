@@ -1,5 +1,6 @@
+import { MAX_EMPTY_BODY_BYTES } from "@/lib/constants";
 import { guardApiRequest } from "@/lib/server/api-guard";
-import { jsonError, jsonOk } from "@/lib/server/http";
+import { BodyTooLargeError, discardBody, jsonError, jsonOk } from "@/lib/server/http";
 import { describeError, logger } from "@/lib/server/logger";
 import { consumeSecret } from "@/lib/server/secret-store";
 
@@ -24,6 +25,15 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   try {
     const guard = await guardApiRequest(request, "reveal");
     if (guard instanceof Response) return guard;
+
+    // This endpoint takes no input, but a caller can still send a body. Cap and discard it
+    // rather than absorbing an unbounded upload.
+    try {
+      await discardBody(request, MAX_EMPTY_BODY_BYTES);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) return jsonError("payload_too_large", 413);
+      throw error;
+    }
 
     const { id } = await context.params;
 

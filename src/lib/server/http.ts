@@ -1,6 +1,7 @@
 import "server-only";
 
 import { utf8Decode } from "@/lib/crypto/encoding";
+import { parseJsonSafely } from "@/lib/safe-json";
 
 /**
  * Uniform JSON responses.
@@ -71,6 +72,39 @@ export function jsonError(
   });
 }
 
+/**
+ * Read and discard a request body, refusing anything over `maxBytes`.
+ *
+ * Endpoints that take no input still receive whatever a client chooses to send. Without a
+ * cap they will happily absorb an arbitrarily large upload — unmetered work an attacker
+ * can force *after* the rate limiter has already granted them the slot.
+ */
+export async function discardBody(request: Request, maxBytes: number): Promise<void> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const size = Number(declared);
+    if (Number.isFinite(size) && size > maxBytes) throw new BodyTooLargeError();
+  }
+
+  const body = request.body;
+  if (body === null) return;
+
+  const reader = body.getReader();
+  let received = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      received += value?.byteLength ?? 0;
+      if (received > maxBytes) throw new BodyTooLargeError();
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+}
+
 export class BodyTooLargeError extends Error {
   constructor() {
     super("request body exceeds the configured limit");
@@ -132,7 +166,9 @@ export async function readJsonBody(request: Request, maxBytes: number): Promise<
   }
 
   try {
-    return JSON.parse(utf8Decode(merged));
+    // Prototype keys are stripped here, at the single point where untrusted JSON enters
+    // the process, so no downstream schema has to defend against them.
+    return parseJsonSafely(utf8Decode(merged));
   } catch {
     throw new MalformedBodyError();
   }

@@ -57,6 +57,8 @@ export const KEY_B64_LENGTH = base64UrlLength(AES_KEY_BYTES);
 export const MAX_STORED_ENVELOPE_BYTES = 16 * 1024;
 /** Upper bound for any request body we will read off the socket. */
 export const MAX_REQUEST_BODY_BYTES = 20 * 1024;
+/** Cap for endpoints that take no input but may still be sent one. */
+export const MAX_EMPTY_BODY_BYTES = 1024;
 
 /** Passphrase bounds. Lower bound is advisory UX, upper bound prevents KDF abuse. */
 export const MIN_PASSPHRASE_LENGTH = 8;
