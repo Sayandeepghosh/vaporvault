@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef } from "react";
+import { useCallback, useId, useRef } from "react";
 
 import { Button } from "@/components/ui/Button";
 import { Callout } from "@/components/ui/Callout";
@@ -20,6 +20,9 @@ function formatExpiry(iso: string): string {
 
 export function SecretLinkPanel({ url, expiresAt, onReset }: SecretLinkPanelProps) {
   const input = useRef<HTMLInputElement>(null);
+  // useId rather than a hardcoded id: a fixed global selector is both a duplicate-id
+  // hazard and a stable handle for any extension or bookmarklet looking for the key.
+  const linkFieldId = useId();
   const getUrl = useCallback(() => url, [url]);
 
   return (
@@ -29,16 +32,29 @@ export function SecretLinkPanel({ url, expiresAt, onReset }: SecretLinkPanelProp
       </Callout>
 
       <div className="space-y-2">
-        <label htmlFor="secret-link" className="block text-sm font-medium text-slate-200">
+        <label htmlFor={linkFieldId} className="block text-sm font-medium text-slate-200">
           One-time link
         </label>
         <div className="flex flex-col gap-2 sm:flex-row">
           <input
             ref={input}
-            id="secret-link"
+            id={linkFieldId}
             type="text"
             readOnly
             value={url}
+            /*
+             * This field holds the decryption key in its fragment, so it gets exactly the
+             * same extension and password-manager opt-outs as the plaintext textarea.
+             * Shielding only the textarea would protect half of the sensitive surface.
+             */
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
+            data-gramm="false"
+            data-gramm_editor="false"
+            data-enable-grammarly="false"
+            data-1p-ignore="true"
+            data-lpignore="true"
             // Select the whole link on focus so keyboard users can copy in two keystrokes.
             onFocus={(event) => event.currentTarget.select()}
             onClick={() => input.current?.select()}
@@ -51,7 +67,7 @@ export function SecretLinkPanel({ url, expiresAt, onReset }: SecretLinkPanelProp
         </p>
       </div>
 
-      <Callout tone="warning" title="This link is shown once">
+      <Callout tone="warning" role="alert" title="This link is shown once">
         <ul className="list-disc space-y-1 pl-5">
           <li>
             The decryption key lives in the <code className="font-mono">#fragment</code> of the
