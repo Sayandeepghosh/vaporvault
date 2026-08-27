@@ -133,6 +133,14 @@ type PlatformEnv = Pick<
  * cannot be influenced by a caller — which is what makes it safe to trust them for CSRF
  * decisions. Anything not on this list still has to be declared in `ALLOWED_ORIGINS`.
  */
+/**
+ * A bare DNS hostname: labels of letters, digits and interior hyphens, at least two of
+ * them. Deliberately strict, because `new URL()` is far too permissive for this job —
+ * `https://myapp.vercel.app@evil.example` parses happily and yields `https://evil.example`,
+ * which would *replace* the deployment's own origin in the allow-list with an attacker's.
+ */
+const PLATFORM_HOSTNAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+
 function platformOrigins(env: PlatformEnv): string[] {
   if (!env.VERCEL) return [];
 
@@ -141,16 +149,30 @@ function platformOrigins(env: PlatformEnv): string[] {
 
   for (const host of hosts) {
     if (!host) continue;
-    const candidate = host.includes("://") ? host : `https://${host}`;
-    try {
-      origins.push(new URL(candidate).origin);
-    } catch {
-      // A malformed platform variable is not worth failing a boot over; skip it.
+    // Reject anything carrying a scheme, userinfo, port, path, comma or whitespace, and
+    // always compose the origin ourselves over https. The platform documents these as bare
+    // hostnames served over TLS; anything else means our assumption is wrong, and the safe
+    // response is to ignore the value rather than to guess at it.
+    if (!PLATFORM_HOSTNAME.test(host)) {
+      console.warn("[vaporvault] ignoring malformed platform hostname in origin allow-list");
+      continue;
     }
+    origins.push(`https://${host.toLowerCase()}`);
   }
 
   return origins;
 }
+
+/**
+ * Values published in `.env.example`, plus the usual suspects.
+ *
+ * The template's `APP_SECRET` placeholder is 42 characters, so it satisfies the 32-character
+ * minimum. Without this check the documented Quick Start — `cp .env.example .env` — yields a
+ * production deployment whose HMAC key is a string printed in a public repository, which
+ * would let anyone recompute every Redis key and de-pseudonymise every rate-limit identity.
+ */
+const PLACEHOLDER_SECRET =
+  /^(replace[-_ ]?me|change[-_ ]?me|change[-_ ]?this|changeit|your[-_ ]|devpassword|password|hunter2|insecure|placeholder|todo|xxxx)/i;
 
 /** Domain-separated sub-key derivation, so one leaked purpose does not leak the others. */
 function deriveSubKey(appSecret: string, label: string): Buffer {
@@ -181,6 +203,18 @@ export function getServerConfig(): ServerConfig {
   }
 
   let appSecret = env.APP_SECRET;
+
+  if (appSecret && PLACEHOLDER_SECRET.test(appSecret)) {
+    if (isProduction) {
+      throw new ConfigurationError(
+        "APP_SECRET is still the example placeholder. Generate one with: openssl rand -hex 32",
+      );
+    }
+    console.warn(
+      "[vaporvault] APP_SECRET looks like the example placeholder. This must not reach production.",
+    );
+  }
+
   if (!appSecret) {
     if (isProduction) {
       throw new ConfigurationError("APP_SECRET must be set in production");
