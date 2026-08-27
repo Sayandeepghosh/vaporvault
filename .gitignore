@@ -22,7 +22,26 @@
 
 # misc
 .DS_Store
+
+# credentials and key material
 *.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# downloaded archives and packages: never part of the source tree, and a stray one here
+# would be published by `git add .` and copied into the Docker build context
+*.deb
+*.rpm
+*.tar
+*.tar.*
+*.tgz
+*.zip
+
+# editor state
+.vscode/
+.idea/
 
 # debug
 npm-debug.log*

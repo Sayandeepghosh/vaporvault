@@ -5,10 +5,13 @@ services:
   # Ephemeral store.
   #
   # Persistence is switched off on purpose. Ciphertext is worthless without the
-  # key in the URL fragment, but writing it to disk creates a durable artefact
-  # that outlives the secret's lifetime and ends up in backups and snapshots.
-  # RDB and AOF are both disabled and /data is a tmpfs, so nothing survives a
-  # restart -- which is exactly the guarantee the product makes.
+  # key in the URL fragment, but a persistence file outlives the secret's
+  # lifetime and ends up in backups and snapshots. RDB and AOF are both disabled
+  # and /data is a tmpfs, so no Redis data file is ever written.
+  #
+  # (Note the limit of that claim: tmpfs pages and Redis' own heap are both
+  # swappable, so "never touches a disk" additionally requires swap to be off or
+  # encrypted on the host. See the README.)
   #
   # `noeviction` matters just as much: under an eviction policy Redis would
   # silently drop live secrets when memory filled up, and senders would hand out
@@ -17,6 +20,18 @@ services:
   redis:
     image: redis:8.10.1-alpine
     restart: unless-stopped
+    init: true
+    # ---------------------------------------------------------------------------
+    # Run as the image's own unprivileged redis user (uid 999 / gid 1000).
+    #
+    # This is load-bearing, not cosmetic. The official entrypoint drops from root
+    # to uid 999 itself, but it gates that on having SETUID/SETGID in the bounding
+    # set. `cap_drop: ALL` empties that set, so the check fails, the whole drop
+    # block is skipped *silently*, and redis-server ends up running as root — the
+    # hardening directive would otherwise have defeated a stronger control.
+    # Starting as non-root means the entrypoint skips the block by design.
+    # ---------------------------------------------------------------------------
+    user: "999:1000"
     command:
       - redis-server
       - --requirepass
@@ -31,13 +46,14 @@ services:
       - noeviction
       - --loglevel
       - notice
-    # Not published to the host: reachable only from the app on the internal network.
+    # Not published to the host: reachable only from the app, on a network with no
+    # route off the host.
     expose:
       - "6379"
     networks:
-      - internal
+      - backend
     tmpfs:
-      - /data
+      - /data:uid=999,gid=1000,mode=0700
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -50,35 +66,65 @@ services:
       retries: 5
       start_period: 5s
     environment:
+      # Duplicated from `command` so the healthcheck can authenticate. Both are visible
+      # via `docker inspect`; anyone who can run that is already root-equivalent on the
+      # host. For a real deployment, mount a redis.conf instead.
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   app:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    init: true
     depends_on:
       redis:
         condition: service_healthy
+    # Every documented knob in .env reaches the container. Without this, the rate limits
+    # and Redis timeouts in .env.example were silently decorative in the Compose stack:
+    # the app read them from process.env and always got the defaults.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Listed after env_file so these always win.
       NODE_ENV: production
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
-      APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env (32+ chars)}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env (32+ random chars)}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS in .env, e.g. http://localhost:3000}
       # 0 = ignore X-Forwarded-For, because with no reverse proxy in front of the
       # app that header is entirely client-controlled. Raise this to the number of
       # proxies you actually operate to get per-client rate limiting. See README.
       TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
       CLIENT_IP_HEADER: ${CLIENT_IP_HEADER:-x-forwarded-for}
+    # Loopback only. Web Crypto requires a secure context, and http://<LAN-ip>:3000 is not
+    # one, so exposing this on the LAN would serve a broken app over cleartext. Put a TLS
+    # terminating proxy in front for anything beyond local use.
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "127.0.0.1:${APP_PORT:-3000}:3000"
     networks:
-      - internal
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
 networks:
-  internal:
+  backend:
     driver: bridge
+    # No route off the host: a compromised Redis or app container cannot reach the
+    # internet. The published port above still works, because port publishing does not
+    # depend on the container network having external connectivity.
+    internal: true

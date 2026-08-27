@@ -16,8 +16,10 @@ ENV NEXT_TELEMETRY_DISABLED=1
 FROM base AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-# `npm ci` installs devDependencies too: the build needs TypeScript and Tailwind.
-RUN npm ci
+# devDependencies are needed (TypeScript, Tailwind), but their install scripts are not:
+# `next build` invokes none of them, so running them would be two arbitrary-code-execution
+# points in the build for no benefit.
+RUN npm ci --ignore-scripts
 
 # --- build -----------------------------------------------------------------
 FROM base AS builder

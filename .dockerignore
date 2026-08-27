@@ -6,6 +6,17 @@ out
 build
 coverage
 npm-debug.log*
+*.log
+*.tsbuildinfo
+github_push.sh
+SECURITY.md
+.github
+*.deb
+*.rpm
+*.tar
+*.tar.*
+*.tgz
+*.zip
 Dockerfile
 .dockerignore
 docker-compose.yml
