@@ -112,9 +112,15 @@ docker compose up --build
 
 Open <http://localhost:3000>.
 
-Redis runs with persistence disabled (`--save ""`, `--appendonly no`) on a `tmpfs`, so
-ciphertext never touches a disk or a backup, and with `--maxmemory-policy noeviction` so
-live secrets are never silently evicted under memory pressure.
+Redis runs with persistence disabled (`--save ""`, `--appendonly no`) on a `tmpfs`, so no
+Redis data file is ever written and nothing survives a restart. It runs as the image's own
+unprivileged user on a network with no route off the host, with `--maxmemory-policy
+noeviction` so live secrets are never silently evicted under memory pressure.
+
+One honest limit on that guarantee: tmpfs pages and Redis' own heap are both swappable, so
+"ciphertext never reaches a disk" additionally requires swap to be disabled or encrypted on
+the host. What the configuration guarantees on its own is that no *persistence file* is
+written.
 
 ---
 
@@ -242,6 +248,10 @@ existing links stop resolving on restart.
 | `npm run lint` | ESLint |
 | `npm test` | Vitest |
 
+CI runs lint, typecheck, `npm audit --omit=dev`, the full test suite against a real Redis
+service container, a production build, and the end-to-end suite against that build. Security
+reports go through [SECURITY.md](./SECURITY.md).
+
 Unit tests (crypto, codecs, envelope validation, the CSRF gate) need nothing. The integration
 and end-to-end suites are skipped unless you point them at real infrastructure:
 
@@ -348,7 +358,7 @@ balancer can reach it, and returns nothing beyond up/down.
 | Oversized payload DoS | 10 KB plaintext cap, streaming 20 KB body cap that ignores `Content-Length` |
 | Rate-limit evasion via `X-Forwarded-For` | Hop-counted from the right; header ignored unless proxies are declared |
 | Redis outage silently disabling limits | Limiter fails closed (`503`) |
-| Secrets surviving in backups | Persistence disabled and `tmpfs` for `/data` (self-hosted; see the Vercel caveats) |
+| Secrets surviving in backups | No persistence file written: RDB and AOF both disabled, `/data` on `tmpfs` (self-hosted; needs swap off for the full claim, and see the Vercel caveats) |
 | Secret ids or ciphertext in logs | Redacting structured logger |
 
 **Not protected against — by construction**
@@ -383,7 +393,7 @@ src/
 │   ├── api-contract.ts       shared Zod schemas, so client and server cannot drift
 │   └── constants.ts          the wire protocol, in one file
 └── proxy.ts                  per-request nonce CSP
-tests/                        crypto · CSRF gate · Redis integration · HTTP end-to-end
+tests/                        crypto · CSRF gate · hardening regressions · Redis · HTTP e2e
 ```
 
 The crypto layer has no server imports and the server layer is fenced off with
