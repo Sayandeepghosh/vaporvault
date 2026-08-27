@@ -1,0 +1,40 @@
+version: 2
+
+# `npm audit` is necessary but not sufficient: advisory databases lag disclosure, and a
+# framework patch release can carry a critical fix days before the advisory is ingested.
+# Dependabot watches upstream releases directly, which is the gap this closes.
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    # Versions are pinned exactly, so every bump is an explicit, reviewable change.
+    versioning-strategy: increase
+    groups:
+      # Keep next and its ESLint config in lockstep; they share a version.
+      next:
+        patterns:
+          - "next"
+          - "eslint-config-next"
+      types:
+        patterns:
+          - "@types/*"
+      dev:
+        dependency-type: development
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "eslint-config-next"
+          - "@types/*"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

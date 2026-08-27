@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Catch newly-disclosed advisories in pinned dependencies even with no code change.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # A real Redis, because the burn-on-read guarantee rests entirely on Redis semantics
+    # (GETDEL atomicity, SET NX EX, MULTI). Without this service the integration and
+    # end-to-end suites skip silently and `npm test` reports green while testing none of
+    # the controls the threat model depends on.
+    services:
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+      APP_SECRET: ci-only-app-secret-ci-only-app-secret-0123456789
+      ALLOWED_ORIGINS: http://localhost:3000
+      REDIS_URL: redis://127.0.0.1:6379
+
+    steps:
+      # Actions are pinned by commit SHA, not tag: a tag can be moved to point at
+      # different code, which turns a third-party action into a supply-chain risk.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # --ignore-scripts: nothing in the build needs a dependency's install hook, so we do
+      # not execute third-party code just to install.
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=moderate
+
+      - name: Lint
+        run: npm run lint -- --max-warnings=0
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: End-to-end tests against the production build
+        run: |
+          npm start > /tmp/server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/api/health
+          E2E_BASE_URL=http://127.0.0.1:3000 E2E_ORIGIN=http://localhost:3000 npm test
+
+      - name: Server log on failure
+        if: failure()
+        run: cat /tmp/server.log || true
