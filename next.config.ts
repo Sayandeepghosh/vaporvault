@@ -54,6 +54,13 @@ const nextConfig: NextConfig = {
   output: process.env.VERCEL ? undefined : "standalone",
   // Do not advertise the framework version.
   poweredByHeader: false,
+  /**
+   * The app renders no images, so the optimizer is pure attack surface: it is a live
+   * endpoint that hands attacker-influenced input to a native image decoder (sharp), and
+   * it has already been the subject of repeated critical advisories. Disabling it removes
+   * `/_next/image` entirely rather than relying on `remotePatterns: []` to keep it closed.
+   */
+  images: { unoptimized: true },
   async headers() {
     const headers = [
       ...securityHeaders,
