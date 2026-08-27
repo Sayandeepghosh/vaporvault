@@ -253,4 +253,91 @@ suite("HTTP end to end", () => {
     const { response } = await createSecret("no-ambient-credentials");
     expect(response.headers.get("set-cookie")).toBeNull();
   });
+
+  /**
+   * Header contract.
+   *
+   * The proxy matcher previously used an unanchored pattern with unescaped dots, so paths
+   * like `/favicon.ico`, `/faviconXico` and `/_next/staticx` were excluded from it while
+   * still rendering the full HTML app shell — served with no Content-Security-Policy at
+   * all. A table test over paths is the cheapest way to stop that class of regression.
+   */
+  it("serves a nonce-based CSP on every path that returns HTML", async () => {
+    const paths = [
+      "/",
+      "/s/AAAAAAAAAAAAAAAAAAAAAA",
+      "/favicon.ico",
+      "/faviconXico",
+      "/robotsXtxt",
+      "/_next/staticx",
+      "/_next/imagex",
+      "/definitely-not-a-route",
+    ];
+
+    for (const path of paths) {
+      const response = await fetch(`${BASE_URL}${path}`);
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("text/html")) continue;
+
+      const csp = response.headers.get("content-security-policy");
+      expect(csp, `${path} must carry a CSP`).toBeTruthy();
+      expect(csp, `${path} must use a nonce`).toMatch(/script-src [^;]*'nonce-[A-Za-z0-9+/=]+'/);
+      expect(csp, `${path} must not allow inline script`).not.toContain(
+        "script-src 'self' 'unsafe-inline'",
+      );
+      expect(csp, `${path} must block form submission`).toContain("form-action 'none'");
+      expect(csp, `${path} must block framing`).toContain("frame-ancestors 'none'");
+      expect(csp, `${path} must keep XHR same-origin`).toContain("connect-src 'self'");
+    }
+  });
+
+  it("stamps every script tag with the nonce from that same response", async () => {
+    for (const path of ["/", "/s/AAAAAAAAAAAAAAAAAAAAAA"]) {
+      const response = await fetch(`${BASE_URL}${path}`);
+      const html = await response.text();
+      const nonce = /'nonce-([A-Za-z0-9+/=]+)'/.exec(
+        response.headers.get("content-security-policy") ?? "",
+      )?.[1];
+
+      expect(nonce, `${path} nonce`).toBeTruthy();
+      const scripts = html.match(/<script(?![^>]*\bsrc="https?:)[^>]*>/g) ?? [];
+      expect(scripts.length, `${path} should render scripts`).toBeGreaterThan(0);
+      for (const tag of scripts) {
+        expect(tag, `${path}: un-nonced script`).toContain(`nonce="${nonce}"`);
+      }
+    }
+  });
+
+  it("issues a fresh nonce per response", async () => {
+    const nonces = new Set<string>();
+    for (let i = 0; i < 3; i += 1) {
+      const csp = (await fetch(`${BASE_URL}/`)).headers.get("content-security-policy") ?? "";
+      nonces.add(/'nonce-([A-Za-z0-9+/=]+)'/.exec(csp)?.[1] ?? "");
+    }
+    expect(nonces.size).toBe(3);
+  });
+
+  it("keeps secret pages uncacheable and unindexable", async () => {
+    const response = await fetch(`${BASE_URL}/s/AAAAAAAAAAAAAAAAAAAAAA`);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(response.headers.get("x-robots-tag")).toContain("noindex");
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
+  });
+
+  it("has removed the image optimizer endpoint entirely", async () => {
+    // Not merely locked down with `remotePatterns: []` — the route should not exist, so the
+    // whole class of image-decoder advisories is unreachable.
+    const response = await fetch(`${BASE_URL}/_next/image?url=%2Ficon.svg&w=64&q=75`);
+    expect(response.status).toBe(404);
+  });
+
+  it("caps a body sent to an endpoint that takes no input", async () => {
+    const response = await fetch(`${BASE_URL}/api/secrets/AAAAAAAAAAAAAAAAAAAAAA/reveal`, {
+      method: "POST",
+      headers: JSON_HEADERS(),
+      body: "x".repeat(64 * 1024),
+    });
+    expect(response.status).toBe(413);
+  });
 });
